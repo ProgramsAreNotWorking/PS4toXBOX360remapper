@@ -133,8 +133,9 @@ layout, revisa `evtest` y ajusta el código o usa las opciones disponibles.
    funciona como un DS4.
 5. **Touchpad.** Solo se reenvía el clic como Back; el movimiento no se
    convierte en ratón.
-6. **Sensores.** El giroscopio y el acelerómetro se capturan pero no se
-   reenvían.
+6. **Sensores.** El daemon no abre el giroscopio ni el acelerómetro porque no
+   se reenvían; udev oculta esos nodos para usuarios normales mientras está
+   activo.
 7. **Steam Input.** Steam puede aplicar su propia capa de remapping. Si un
    juego ve botones cambiados, revisa la configuración de Steam Input.
 8. **Bluetooth.** La latencia, la vibración y la reconexión dependen del

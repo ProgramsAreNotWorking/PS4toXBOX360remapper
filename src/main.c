@@ -64,6 +64,8 @@ void print_usage(FILE *out)
         "      --test-rumble           probar la vibracion al detectar el mando\n"
         "      --swap-sticks-triggers  clones con el stick derecho en Z/RZ y\n"
         "                              los gatillos en RX/RY\n"
+        "      --trace-prefix RUTA     guardar prefijo-input.csv y\n"
+        "                              prefijo-output.csv al salir\n"
         "  -l, --list                  listar dispositivos de entrada y salir\n"
         "      --self-test             ejecutar las pruebas de mapeo y salir\n"
         "  -v, --verbose               mostrar registros de depuracion\n"
@@ -75,6 +77,7 @@ void print_usage(FILE *out)
         "  sudo ds4xbox\n"
         "  sudo ds4xbox --profile xboxone\n"
         "  sudo ds4xbox --device /dev/input/event12 --verbose\n"
+        "  sudo ds4xbox --verbose --trace-prefix /tmp/ds4xbox\n"
         "  ds4xbox --list\n"
         "\n"
         "La primera vez hay que emparejar el mando por Bluetooth con BlueZ.\n"
@@ -91,6 +94,7 @@ int main(int argc, char **argv)
         { "no-ff", no_argument, NULL, 1002 },
         { "test-rumble", no_argument, NULL, 1005 },
         { "swap-sticks-triggers", no_argument, NULL, 1003 },
+        { "trace-prefix", required_argument, NULL, 1006 },
         { "list", no_argument, NULL, 'l' },
         { "self-test", no_argument, NULL, 1004 },
         { "verbose", no_argument, NULL, 'v' },
@@ -161,6 +165,17 @@ int main(int argc, char **argv)
 
         case 1005:
             daemon.test_rumble = true;
+            break;
+
+        case 1006:
+            if (optarg[0] == '\0' ||
+                strlen(optarg) + sizeof("-output.csv") >
+                    sizeof(daemon.trace_prefix)) {
+                fprintf(stderr, "ds4xbox: prefijo de traza vacio o demasiado largo\n");
+                return 2;
+            }
+            snprintf(daemon.trace_prefix, sizeof(daemon.trace_prefix),
+                     "%s", optarg);
             break;
 
         case 'l':

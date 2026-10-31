@@ -285,8 +285,65 @@ daemon ya no descarta el informe completo. Comprueba el log:
 journalctl -u ds4xbox.service -f
 ```
 
+El servicio instalado arranca con `--quiet`. Para ver la instrumentación,
+detén el servicio si está instalado y ejecuta el binario local en primer
+plano. Si `systemctl` responde `Unit ... not loaded`, no hay servicio que
+detener; puedes ejecutar directamente el binario. Si `make` no está en el
+PATH, entra primero al entorno de desarrollo con `nix-shell` y compila con
+`make`.
+
+```bash
+sudo ./ds4xbox --verbose
+```
+
+Al salir con `Ctrl+C`, el daemon elimina `/run/ds4xbox/active` y ejecuta
+`udevadm trigger` para que las reglas vuelvan a dar acceso al mando original.
+
+El daemon imprime una línea `stats` por segundo y por mando. Incluye el
+promedio y el rango de eventos `EV_ABS` por informe de entrada, cuántos
+valores de eje coalesció, los informes encolados/escritos/descartados, la
+ocupación máxima de la cola y los eventos `SYN_DROPPED` observados.
+También identifica cada nodo activo, su función y sus contadores para
+distinguir pérdidas del gamepad de las del touchpad.
+`input lag max` mide la antigüedad máxima de los eventos físicos al leerlos;
+`device scan` registra cuánto tardó un rescaneo. Un lag alto con un rescaneo
+de duración similar identifica un bloqueo en la enumeración; lag alto sin
+rescaneo apunta a una pausa en otra parte del sistema o del daemon. Si aparece
+`cannot use monotonic timestamps`, el kernel no permite esa medición y `input
+lag max` no sirve para diagnosticar esa ejecución.
+
+Para comparar exactamente lo leído del gamepad con lo escrito al mando
+virtual, activa la captura opcional:
+
+```bash
+sudo systemctl stop ds4xbox.service  # si existe; si no, omite esta línea
+sudo ./ds4xbox --verbose --trace-prefix /tmp/ds4xbox
+```
+
+Reproduce el tirón y termina con `Ctrl+C`. Al salir se crean
+`/tmp/ds4xbox-input.csv` y `/tmp/ds4xbox-output.csv`. La primera contiene los
+eventos crudos del nodo gamepad físico y cuándo los leyó el daemon; la segunda,
+los eventos que `write()` aceptó para uinput y cuándo los escribió. Ambas usan
+nanosegundos de reloj monotónico cuando el kernel lo permite. En la entrada,
+`source_ns=0` indica que el kernel no habilitó ese reloj; `read_ns` sigue
+disponible. Las columnas `controller`, `generation` y `report` permiten alinear
+el mismo informe entre archivos, incluso tras reconectar el mando. Un estado
+virtual inicial puede aparecer con `report=0` porque no corresponde a una
+muestra física.
+
+La captura permanece en memoria durante la prueba para no escribir en disco en
+cada evento; conserva los últimos 262144 registros y avisa al salir si tuvo que
+sobrescribir registros antiguos. Los archivos con ese prefijo se reemplazan al
+guardar. Un `SIGKILL` o un apagado brusco evita que se escriban. La ausencia de
+un evento en `input.csv` apunta a la ruta física/kernel; si aparece en entrada
+pero falta o se retrasa en salida, el problema está entre la lectura y uinput.
+La salida confirma que uinput aceptó la escritura, no que el juego la consumió.
+
 - `uinput busy; queueing input` es normal y significa que se está usando la
   cola.
+- `input event queue overrun` indica que el daemon no leyó un nodo evdev a
+  tiempo. Ignora los eventos obsoletos hasta el siguiente `SYN_REPORT` y
+  vuelve a consultar el estado actual de botones y ejes.
 - `uinput queue overflow; dropped N report(s)` indica que el consumidor va
   demasiado lento incluso para 128 informes; suele ser un problema del juego,
   de Steam Input o de un programa que abre el mando virtual y no lee.

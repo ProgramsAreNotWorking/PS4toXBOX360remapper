@@ -41,9 +41,11 @@ Mando PS4/PS5 (USB o Bluetooth)
 +-------------------+
 ```
 
-El daemon abre los nodos evdev del mando Sony, los captura con `EVIOCGRAB` y
-crea un mando Xbox virtual con `/dev/uinput`. Las reglas udev dejan los nodos
-originales en `0600 root:root`, les quitan la etiqueta `uaccess` y borran
+El daemon abre el nodo evdev del gamepad y, si existe, el del clic del
+touchpad; captura esos nodos con `EVIOCGRAB` y crea un mando Xbox virtual con
+`/dev/uinput`. No lee los nodos de sensores ni de audio porque no se traducen.
+Las reglas udev dejan todos los nodos originales en `0600 root:root`, les
+quitan la etiqueta `uaccess` y borran
 `ID_INPUT*`, de modo que Steam, SDL, libinput y los juegos no los detectan
 como mando. La etiqueta `seat` se conserva para poder restaurar el acceso
 normal cuando el daemon se detiene.
@@ -238,6 +240,9 @@ sudo ds4xbox --profile xboxone
 # Un solo mando concreto
 sudo ds4xbox --device /dev/input/event12 --verbose
 
+# Guardar eventos físicos y virtuales con marcas de tiempo para compararlos
+sudo ds4xbox --verbose --trace-prefix /tmp/ds4xbox
+
 # Clones con el stick derecho en Z/RZ y los gatillos en RX/RY
 sudo ds4xbox --swap-sticks-triggers
 
@@ -259,6 +264,7 @@ Opciones:
 | `--no-ff` | Desactiva la vibración/force feedback. |
 | `--test-rumble` | Al detectar el mando, reproduce una vibración corta de prueba. |
 | `--swap-sticks-triggers` | Intercambia stick derecho y gatillos en clones. |
+| `--trace-prefix RUTA` | Guarda eventos físicos y virtuales en dos CSV al salir. |
 | `-l, --list` | Lista dispositivos de entrada y sale. |
 | `--self-test` | Ejecuta las pruebas de mapeo y sale. |
 | `-v, --verbose` | Registros de depuración. |
@@ -404,8 +410,10 @@ Con las reglas udev instaladas y el daemon ejecutándose como root:
   ACL sobre esos nodos. La etiqueta `seat` se conserva para que udev pueda
   restaurar el acceso normal cuando el daemon se detiene.
 - Se marca `LIBINPUT_IGNORE_DEVICE=1` para que libinput lo ignore.
-- El daemon captura los nodos con `EVIOCGRAB`, de modo que otro programa que
-  consiga abrirlos no recibe eventos.
+- El daemon captura el gamepad y el touchpad con `EVIOCGRAB`, de modo que otro
+  programa que consiga abrirlos no recibe eventos. Los nodos de sensores y
+  audio siguen ocultos para usuarios normales por los permisos y propiedades
+  udev, aunque el daemon no los abra.
 
 La ocultación es **temporal**: solo está activa mientras el daemon está en
 ejecución. Al pararlo (o al parar el servicio) se elimina el flag

@@ -48,10 +48,9 @@ USB / Bluetooth ---> | kernel hid-playstation|
                                 v
 +----------------------+   +----------------------+
 | eventN (gamepad)     |   | eventM (touchpad)    |
-| eventP (motion)      |   | eventQ (jack)        |
 +----------+-----------+   +----------+-----------+
            |                          |
-           |        EVIOCGRAB         |
+           | EVIOCGRAB                | EVIOCGRAB
            +------------+-------------+
                         |
                         v
@@ -74,6 +73,9 @@ USB / Bluetooth ---> | kernel hid-playstation|
               +--------------------+
 ```
 
+Los nodos de sensores y jack no se muestran en el flujo: udev los oculta
+mientras el daemon está activo y el daemon no los abre para procesar eventos.
+
 El daemon es **single-threaded**. Usa `epoll` para esperar eventos de:
 
 - Los descriptores de los nodos evdev capturados.
@@ -82,8 +84,15 @@ El daemon es **single-threaded**. Usa `epoll` para esperar eventos de:
   (`EV_UINPUT`: `UI_FF_UPLOAD` / `UI_FF_ERASE`) y los eventos `EV_FF` de
   reproducción.
 
-Un temporizador de rescaneo de 1 segundo complementa a `inotify` para
-detectar dispositivos que aparecen o desaparecen sin evento.
+`inotify` inicia un rescaneo cuando aparece o desaparece un nodo. Para no
+bloquear el reenvío de eventos con una enumeración completa cada segundo, el
+temporizador de rescaneo de 1 segundo se usa solo si no se pudo instalar la
+vigilancia `inotify`.
+
+Si evdev informa `SYN_DROPPED`, el daemon descarta los eventos de ese nodo
+hasta el siguiente `SYN_REPORT` y consulta entonces el estado actual con
+`EVIOCGKEY`/`EVIOCGABS`. Así evita aplicar eventos obsoletos que quedaron en
+la cola antes de recuperar el estado de botones y ejes.
 
 La escritura al `uinput` es **no bloqueante**. Cada `SYN_REPORT` se encola
 como una unidad (`struct output_frame`) en una cola de 128 informes; si el
@@ -118,16 +127,19 @@ Al quitar ese sufijo, todos los nodos del mismo mando comparten grupo. Si el
 dispositivo no expone `phys`, se usa `EVIOCGUNIQ`; si tampoco, la ruta del nodo.
 
 El **primario** es el nodo con capacidades de gamepad (botones y ejes de
-sticks/gatillos). Los demás nodos del grupo se añaden como secundarios:
+sticks/gatillos). Solo se abre y añade al bucle el primario y, si existe, el
+touchpad:
 
 - El touchpad se detecta por nombre (`Touchpad`, `Touch Pad`, etc.) o por
-  `BTN_LEFT` + `ABS_MT_POSITION_X`. Solo se reenvía su clic como Back.
-- Los sensores de movimiento y el jack se capturan para que no queden
-  accesibles, pero sus eventos no se traducen.
+  `BTN_LEFT` + `ABS_MT_POSITION_X`; se añade como secundario y solo se reenvía
+  su clic como Back.
+- Los sensores de movimiento, el jack y otros secundarios no se abren: sus
+  eventos no se usan. La regla udev mantiene ocultos todos los nodos Sony
+  mientras el daemon está activo.
 
-Cada miembro se captura con `EVIOCGRAB` antes de crear el mando virtual. Si la
-captura falla con `EBUSY`, otro programa tiene el mando; el daemon registra el
-error y no lo gestiona.
+El gamepad y el touchpad se capturan con `EVIOCGRAB` antes de crear el mando
+virtual. Si la captura falla con `EBUSY`, otro programa tiene el nodo; el
+daemon registra el error y no lo gestiona.
 
 ## uinput: el mando virtual
 
@@ -258,15 +270,17 @@ la limpieza como red de seguridad para un `SIGKILL` o un cuelgue.
 ### 2. EVIOCGRAB
 
 Aunque un programa consiga abrir el nodo (por ejemplo, ejecutándose como
-root), `EVIOCGRAB` hace que solo el daemon reciba los eventos. El daemon
-captura el gamepad, el touchpad, los sensores y el jack.
+root), `EVIOCGRAB` hace que solo el daemon reciba los eventos de los nodos que
+usa: el gamepad y, si está disponible, el touchpad. La regla udev también
+oculta sensores y audio para usuarios normales; el daemon no abre esos nodos
+porque no forman parte del mapeo.
 
 ### Límites
 
 - `lsusb` y `/proc/bus/input/devices` siguen mostrando el dispositivo Sony.
   Los descriptores USB no se pueden cambiar desde espacio de usuario.
-- Un proceso root puede abrir el nodo original; con `EVIOCGRAB` activo no
-  recibe eventos, pero puede ver que existe.
+- Un proceso root puede abrir los nodos originales no capturados, como los
+  sensores; `EVIOCGRAB` bloquea la recepción solo en el gamepad y el touchpad.
 - El mando virtual es un dispositivo `uinput`; algunos anti-cheat lo detectan.
 - La regla udev oculta también otros dispositivos Sony con esos PIDs. Si usas
   un accesorio Sony con el mismo PID, añade una excepción.
@@ -274,7 +288,9 @@ captura el gamepad, el touchpad, los sensores y el jack.
 ## Hotplug, reconexión y varios mandos
 
 - `inotify` observa `/dev/input` y marca `g_rescan` cuando hay cambios.
-- Cada segundo se ejecuta un rescaneo de seguridad.
+- Los cambios detectados por `inotify` inician un rescaneo; el rescaneo
+  periódico de seguridad queda como respaldo si no se pudo instalar la
+  vigilancia.
 - `scan_devices()` enumera los nodos, agrupa y crea controladores nuevos.
 - Cada controlador tiene una `generation` que se incrementa al recrearse; los
   `epoll_ref` guardan la generación para ignorar eventos de descriptores

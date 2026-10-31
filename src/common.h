@@ -44,6 +44,7 @@
 #define DS4_MAX_DEVICES 128
 #define DS4_OUTPUT_EVENTS 64
 #define DS4_OUTPUT_FRAMES 128
+#define DS4_TRACE_RECORDS 262144
 
 #define DS4_BITS_TO_LONGS(nr) (((nr) + 8 * sizeof(unsigned long) - 1) / (8 * sizeof(unsigned long)))
 
@@ -110,6 +111,24 @@ struct device_info {
 };
 
 struct controller;
+struct daemon;
+
+enum trace_stream {
+    TRACE_INPUT = 1,
+    TRACE_OUTPUT,
+};
+
+struct trace_record {
+    uint64_t timestamp_ns;
+    uint64_t observed_ns;
+    uint64_t report_seq;
+    uint64_t generation;
+    int32_t value;
+    uint16_t type;
+    uint16_t code;
+    uint8_t controller;
+    uint8_t stream;
+};
 
 struct epoll_ref {
     int type;
@@ -130,21 +149,56 @@ struct member {
     bool grabbed;
     bool touchpad;
     bool dirty;
+    bool syncing;
+    bool monotonic_clock;
     char path[DS4_PATH_MAX];
+    char name[DS4_NAME_MAX];
     int fd;
+    uint64_t stats_events;
+    uint64_t stats_abs_events;
+    uint64_t stats_reports;
+    uint64_t stats_syn_dropped;
+    uint64_t stats_recoveries;
     struct epoll_ref ref;
 };
 
 struct output_frame {
     struct input_event events[DS4_OUTPUT_EVENTS];
     unsigned int count;
+    unsigned int abs_remaining;
+    uint64_t report_seq;
+};
+
+struct controller_diagnostics {
+    uint64_t last_log_ms;
+    uint64_t input_reports;
+    uint64_t input_abs_sum;
+    uint64_t input_abs_current;
+    uint64_t input_abs_min;
+    uint64_t input_abs_max;
+    uint64_t input_abs_seen;
+    uint64_t input_abs_discarded;
+    uint64_t input_lag_max_us;
+    uint64_t input_recovery_reports;
+    uint64_t syn_dropped;
+    uint64_t abs_coalesced;
+    uint64_t frames_enqueued;
+    uint64_t frames_written;
+    uint64_t frames_dropped;
+    uint64_t abs_enqueued;
+    uint64_t abs_written;
+    uint64_t abs_dropped;
+    uint64_t queue_peak;
 };
 
 struct controller {
     bool active;
     bool dead;
     bool announced;
+    struct daemon *owner;
     uint64_t generation;
+    uint64_t input_report_seq;
+    bool input_report_open;
     bool swap_sticks_triggers;
     int index;
     char group[DS4_GROUP_MAX];
@@ -179,6 +233,7 @@ struct controller {
     unsigned int dpad_state;
     int last_hat_x;
     int last_hat_y;
+    struct controller_diagnostics diagnostics;
     struct epoll_ref uinput_ref;
 };
 
@@ -199,6 +254,12 @@ struct daemon {
     bool active_flag;
     bool test_rumble;
     uint64_t next_generation;
+    char trace_prefix[DS4_PATH_MAX];
+    struct trace_record *trace_records;
+    size_t trace_capacity;
+    size_t trace_count;
+    size_t trace_start;
+    uint64_t trace_overwritten;
     struct epoll_ref inotify_ref;
     char only_device[DS4_PATH_MAX];
 };

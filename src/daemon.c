@@ -24,6 +24,62 @@ static uint64_t monotonic_ms(void)
     return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
 }
 
+static uint64_t monotonic_ns(void)
+{
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
+        return 0;
+    return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+}
+
+static bool trace_path(char *path, size_t path_size, const char *prefix,
+                       const char *suffix)
+{
+    size_t prefix_size = strlen(prefix);
+    size_t suffix_size = strlen(suffix);
+
+    if (path_size == 0 || prefix_size >= path_size ||
+        suffix_size >= path_size - prefix_size)
+        return false;
+
+    memcpy(path, prefix, prefix_size);
+    memcpy(path + prefix_size, suffix, suffix_size + 1);
+    return true;
+}
+
+static void daemon_trace_add(struct daemon *d, uint8_t stream,
+                             const struct controller *c, uint64_t report_seq,
+                             uint64_t timestamp_ns, uint64_t observed_ns,
+                             const struct input_event *event)
+{
+    struct trace_record *record;
+    size_t index;
+
+    if (d->trace_records == NULL || event == NULL)
+        return;
+
+    if (d->trace_count < d->trace_capacity) {
+        index = (d->trace_start + d->trace_count) % d->trace_capacity;
+        d->trace_count++;
+    } else {
+        index = d->trace_start;
+        d->trace_start = (d->trace_start + 1) % d->trace_capacity;
+        d->trace_overwritten++;
+    }
+
+    record = &d->trace_records[index];
+    record->timestamp_ns = timestamp_ns;
+    record->observed_ns = observed_ns;
+    record->report_seq = report_seq;
+    record->generation = c->generation;
+    record->value = event->value;
+    record->type = event->type;
+    record->code = event->code;
+    record->controller = (uint8_t)(c->index + 1);
+    record->stream = stream;
+}
+
 static void copy_string(char *destination, size_t size, const char *source)
 {
     if (size == 0)
@@ -258,6 +314,7 @@ static struct controller *allocate_controller(struct daemon *d)
 
         memset(c, 0, sizeof(*c));
         c->active = true;
+        c->owner = d;
         c->generation = ++d->next_generation;
         c->index = i;
         c->primary_fd = -1;
@@ -292,6 +349,16 @@ static bool controller_has_member(const struct controller *c,
             return true;
     }
     return false;
+}
+
+static bool device_info_is_touchpad(const struct device_info *di)
+{
+    return strstr(di->name, "Touchpad") != NULL ||
+           strstr(di->name, "Touch Pad") != NULL ||
+           strstr(di->name, "touchpad") != NULL ||
+           strstr(di->name, "touch pad") != NULL ||
+           (bit_test(di->keybits, BTN_LEFT) &&
+            bit_test(di->absbits, ABS_MT_POSITION_X));
 }
 
 /* ------------------------------------------------------------------------- */
@@ -448,6 +515,8 @@ static void controller_set_epollout(struct controller *c, bool enable)
 static void controller_enqueue_frame(struct controller *c)
 {
     struct output_frame *frame;
+    unsigned int abs_count = 0;
+    int i;
 
     if (c->outcount <= 0)
         return;
@@ -458,6 +527,11 @@ static void controller_enqueue_frame(struct controller *c)
          * complete report rather than losing the newest input, and
          * resynchronise the full state once the queue drains.
          */
+        frame = &c->outq[c->outq_head];
+        if (g_log_level >= LOG_LVL_DEBUG) {
+            c->diagnostics.frames_dropped++;
+            c->diagnostics.abs_dropped += frame->abs_remaining;
+        }
         c->outq_head = (c->outq_head + 1) % DS4_OUTPUT_FRAMES;
         c->outq_count--;
         c->outq_dropped++;
@@ -468,8 +542,22 @@ static void controller_enqueue_frame(struct controller *c)
     memcpy(frame->events, c->outbuf,
            (size_t)c->outcount * sizeof(struct input_event));
     frame->count = (unsigned int)c->outcount;
+    frame->abs_remaining = 0;
+    frame->report_seq = c->input_report_seq;
+    if (g_log_level >= LOG_LVL_DEBUG) {
+        for (i = 0; i < c->outcount; i++) {
+            if (frame->events[i].type == EV_ABS)
+                abs_count++;
+        }
+        frame->abs_remaining = abs_count;
+        c->diagnostics.frames_enqueued++;
+        c->diagnostics.abs_enqueued += abs_count;
+    }
     c->outq_tail = (c->outq_tail + 1) % DS4_OUTPUT_FRAMES;
     c->outq_count++;
+    if (g_log_level >= LOG_LVL_DEBUG &&
+        c->outq_count > c->diagnostics.queue_peak)
+        c->diagnostics.queue_peak = c->outq_count;
     c->outcount = 0;
 }
 
@@ -521,6 +609,20 @@ static void controller_flush_output(struct controller *c)
             return;
         }
 
+        if (c->owner->trace_records != NULL) {
+            size_t done = (size_t)written / sizeof(struct input_event);
+            uint64_t written_ns = monotonic_ns();
+            size_t i;
+
+            if (done > frame->count)
+                done = frame->count;
+            for (i = 0; i < done; i++) {
+                daemon_trace_add(c->owner, TRACE_OUTPUT, c,
+                                frame->report_seq, written_ns, written_ns,
+                                &frame->events[i]);
+            }
+        }
+
         if ((size_t)written < bytes) {
             size_t done = (size_t)written / sizeof(struct input_event);
 
@@ -538,6 +640,17 @@ static void controller_flush_output(struct controller *c)
             }
 
             if (done < frame->count) {
+                if (g_log_level >= LOG_LVL_DEBUG) {
+                    unsigned int abs_done = 0;
+                    size_t i;
+
+                    for (i = 0; i < done; i++) {
+                        if (frame->events[i].type == EV_ABS)
+                            abs_done++;
+                    }
+                    c->diagnostics.abs_written += abs_done;
+                    frame->abs_remaining -= abs_done;
+                }
                 memmove(frame->events, frame->events + done,
                         (frame->count - done) * sizeof(struct input_event));
                 frame->count -= (unsigned int)done;
@@ -547,6 +660,11 @@ static void controller_flush_output(struct controller *c)
             }
         }
 
+        if (g_log_level >= LOG_LVL_DEBUG) {
+            c->diagnostics.frames_written++;
+            c->diagnostics.abs_written += frame->abs_remaining;
+            frame->abs_remaining = 0;
+        }
         c->outq_head = (c->outq_head + 1) % DS4_OUTPUT_FRAMES;
         c->outq_count--;
     }
@@ -589,6 +707,8 @@ static void controller_emit(struct controller *c, unsigned int type,
             if (c->outbuf[i].type == EV_ABS &&
                 c->outbuf[i].code == code) {
                 c->outbuf[i].value = value;
+                if (g_log_level >= LOG_LVL_DEBUG)
+                    c->diagnostics.abs_coalesced++;
                 return;
             }
         }
@@ -872,8 +992,6 @@ static void controller_handle_primary_event(struct controller *c,
     case EV_SYN:
         if (event->code == SYN_REPORT)
             controller_emit_syn(c);
-        else if (event->code == SYN_DROPPED)
-            controller_resync(c);
         break;
 
     default:
@@ -896,9 +1014,177 @@ static void controller_handle_secondary_event(struct controller *c,
             controller_emit_syn(c);
             member->dirty = false;
         }
-    } else if (event->type == EV_SYN && event->code == SYN_DROPPED) {
-        member->dirty = false;
     }
+}
+
+static const char *controller_member_role(const struct member *member)
+{
+    if (member->primary)
+        return "gamepad";
+    if (member->touchpad)
+        return "touchpad";
+    return "ignored secondary";
+}
+
+static void controller_resync_member_state(struct controller *c,
+                                           struct member *member)
+{
+    unsigned long keybits[DS4_BITS_TO_LONGS(KEY_CNT)];
+
+    if (member->primary) {
+        controller_resync(c);
+        return;
+    }
+
+    if (!member->touchpad)
+        return;
+
+    memset(keybits, 0, sizeof(keybits));
+    if (ioctl(member->fd, EVIOCGKEY(sizeof(keybits)), keybits) < 0) {
+        log_debug("controller %d: EVIOCGKEY failed for %s: %s",
+                  c->index + 1, member->path, strerror(errno));
+        return;
+    }
+
+    controller_emit(c, EV_KEY, BTN_SELECT,
+                    bit_test(keybits, BTN_LEFT) ? 1 : 0);
+    controller_emit_syn(c);
+}
+
+static void controller_track_input_event(struct controller *c,
+                                         struct member *member,
+                                         const struct input_event *event)
+{
+    struct controller_diagnostics *stats = &c->diagnostics;
+
+    if (g_log_level < LOG_LVL_DEBUG)
+        return;
+
+    member->stats_events++;
+    if (event->type == EV_ABS)
+        member->stats_abs_events++;
+    if (event->type == EV_SYN && event->code == SYN_REPORT)
+        member->stats_reports++;
+    if (event->type == EV_SYN && event->code == SYN_DROPPED)
+        member->stats_syn_dropped++;
+
+    if (event->type == EV_SYN && event->code == SYN_DROPPED) {
+        stats->syn_dropped++;
+        if (member->primary)
+            stats->input_abs_current = 0;
+        return;
+    }
+
+    if (event->type == EV_SYN && event->code == SYN_REPORT &&
+        member->syncing) {
+        member->stats_recoveries++;
+        stats->input_recovery_reports++;
+        return;
+    }
+
+    if (!member->primary)
+        return;
+
+    if (event->type == EV_ABS) {
+        stats->input_abs_seen++;
+        if (member->syncing)
+            stats->input_abs_discarded++;
+        else
+            stats->input_abs_current++;
+    }
+
+    if (event->type != EV_SYN || event->code != SYN_REPORT)
+        return;
+
+    {
+        uint64_t count = stats->input_abs_current;
+
+        if (stats->input_reports == 0 || count < stats->input_abs_min)
+            stats->input_abs_min = count;
+        if (count > stats->input_abs_max)
+            stats->input_abs_max = count;
+        stats->input_abs_sum += count;
+        stats->input_reports++;
+    }
+    stats->input_abs_current = 0;
+}
+
+static void controller_log_diagnostics(struct controller *c)
+{
+    struct controller_diagnostics *stats = &c->diagnostics;
+    uint64_t now;
+    uint64_t elapsed;
+    double abs_per_report;
+
+    if (g_log_level < LOG_LVL_DEBUG)
+        return;
+
+    now = monotonic_ms();
+    if (stats->last_log_ms == 0) {
+        stats->last_log_ms = now;
+        return;
+    }
+    elapsed = now - stats->last_log_ms;
+    if (elapsed < 1000)
+        return;
+
+    abs_per_report = stats->input_reports > 0 ?
+        (double)stats->input_abs_sum / (double)stats->input_reports : 0.0;
+    log_debug("controller %d: stats %llums: input reports=%llu "
+              "ABS/report avg=%.2f min=%llu max=%llu seen=%llu "
+              "discarded=%llu input lag max=%lluus coalesced=%llu; "
+              "output frames "
+              "enqueued=%llu written=%llu dropped=%llu "
+              "(ABS enqueued=%llu written=%llu dropped=%llu), "
+              "queue=%u/%u peak=%llu; SYN_DROPPED=%llu "
+              "recovery_reports=%llu",
+              c->index + 1,
+              (unsigned long long)elapsed,
+              (unsigned long long)stats->input_reports,
+              abs_per_report,
+              (unsigned long long)(stats->input_reports > 0 ?
+                                   stats->input_abs_min : 0),
+              (unsigned long long)stats->input_abs_max,
+              (unsigned long long)stats->input_abs_seen,
+              (unsigned long long)stats->input_abs_discarded,
+              (unsigned long long)stats->input_lag_max_us,
+              (unsigned long long)stats->abs_coalesced,
+              (unsigned long long)stats->frames_enqueued,
+              (unsigned long long)stats->frames_written,
+              (unsigned long long)stats->frames_dropped,
+              (unsigned long long)stats->abs_enqueued,
+              (unsigned long long)stats->abs_written,
+              (unsigned long long)stats->abs_dropped,
+              c->outq_count, DS4_OUTPUT_FRAMES,
+              (unsigned long long)stats->queue_peak,
+              (unsigned long long)stats->syn_dropped,
+              (unsigned long long)stats->input_recovery_reports);
+
+    for (size_t i = 0; i < DS4_MAX_MEMBERS; i++) {
+        struct member *member = &c->members[i];
+
+        if (!member->used)
+            continue;
+        if (member->stats_events > 0 || member->stats_syn_dropped > 0) {
+            log_debug("controller %d: node %s (%s; %s): events=%llu "
+                      "ABS=%llu reports=%llu SYN_DROPPED=%llu recovered=%llu",
+                      c->index + 1, member->path, member->name,
+                      controller_member_role(member),
+                      (unsigned long long)member->stats_events,
+                      (unsigned long long)member->stats_abs_events,
+                      (unsigned long long)member->stats_reports,
+                      (unsigned long long)member->stats_syn_dropped,
+                      (unsigned long long)member->stats_recoveries);
+        }
+        member->stats_events = 0;
+        member->stats_abs_events = 0;
+        member->stats_reports = 0;
+        member->stats_syn_dropped = 0;
+        member->stats_recoveries = 0;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+    stats->last_log_ms = now;
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1191,6 +1477,7 @@ static bool controller_add_member(struct daemon *d, struct controller *c,
 {
     struct member *member;
     struct epoll_event event;
+    clockid_t clock_id = CLOCK_MONOTONIC;
     int slot = -1;
     int fd = di->fd;
     int i;
@@ -1217,14 +1504,15 @@ static bool controller_add_member(struct daemon *d, struct controller *c,
     member->used = true;
     member->primary = primary;
     member->fd = fd;
-    member->touchpad =
-        strstr(di->name, "Touchpad") != NULL ||
-        strstr(di->name, "Touch Pad") != NULL ||
-        strstr(di->name, "touchpad") != NULL ||
-        strstr(di->name, "touch pad") != NULL ||
-        (bit_test(di->keybits, BTN_LEFT) &&
-         bit_test(di->absbits, ABS_MT_POSITION_X));
+    member->touchpad = device_info_is_touchpad(di);
     snprintf(member->path, sizeof(member->path), "%s", di->path);
+    snprintf(member->name, sizeof(member->name), "%s", di->name);
+
+    if (ioctl(fd, EVIOCSCLOCKID, &clock_id) == 0)
+        member->monotonic_clock = true;
+    else
+        log_debug("controller %d: cannot use monotonic timestamps on %s: %s",
+                  c->index + 1, di->path, strerror(errno));
 
     if (!d->no_grab) {
         if (ioctl(fd, EVIOCGRAB, 1) < 0) {
@@ -1348,6 +1636,15 @@ static struct controller *controller_create(struct daemon *d,
         if (di->fd < 0)
             continue;
 
+        /* Only the gamepad and touchpad click feed the Xbox mapping. */
+        if (!is_primary && !device_info_is_touchpad(di)) {
+            log_debug("controller %d: ignoring unused secondary node %s (%s)",
+                      c->index + 1, di->path, di->name);
+            close(di->fd);
+            di->fd = -1;
+            continue;
+        }
+
         if (!controller_add_member(d, c, di, is_primary) && is_primary) {
             log_error("controller %d: cannot grab primary gamepad %s",
                       c->index + 1, di->path);
@@ -1426,6 +1723,8 @@ static void controller_handle_member_readable(struct daemon *d,
 {
     struct member *member;
     struct input_event events[64];
+    uint64_t batch_now_us = 0;
+    uint64_t batch_now_ns = 0;
     ssize_t bytes;
     size_t count;
     size_t i;
@@ -1466,9 +1765,78 @@ static void controller_handle_member_readable(struct daemon *d,
         }
 
         count = (size_t)bytes / sizeof(events[0]);
+        batch_now_us = 0;
+        batch_now_ns = 0;
+        if (member->primary &&
+            ((g_log_level >= LOG_LVL_DEBUG && member->monotonic_clock) ||
+             d->trace_records != NULL)) {
+            batch_now_ns = monotonic_ns();
+            if (batch_now_ns != 0)
+                batch_now_us = batch_now_ns / 1000u;
+        }
         for (i = 0; i < count; i++) {
             if (c->dead)
                 return;
+
+            if (batch_now_us != 0 && member->monotonic_clock) {
+                uint64_t event_us =
+                    (uint64_t)events[i].time.tv_sec * 1000000u +
+                    (uint64_t)events[i].time.tv_usec;
+
+                if (batch_now_us > event_us &&
+                    batch_now_us - event_us >
+                        c->diagnostics.input_lag_max_us)
+                    c->diagnostics.input_lag_max_us =
+                        batch_now_us - event_us;
+            }
+
+            if (member->primary) {
+                uint64_t source_ns = 0;
+
+                if (!c->input_report_open) {
+                    c->input_report_seq++;
+                    c->input_report_open = true;
+                }
+                if (member->monotonic_clock) {
+                    source_ns = (uint64_t)events[i].time.tv_sec *
+                                1000000000u +
+                                (uint64_t)events[i].time.tv_usec * 1000u;
+                }
+                daemon_trace_add(d, TRACE_INPUT, c, c->input_report_seq,
+                                source_ns, batch_now_ns, &events[i]);
+                if (events[i].type == EV_SYN &&
+                    events[i].code == SYN_REPORT)
+                    c->input_report_open = false;
+            }
+
+            controller_track_input_event(c, member, &events[i]);
+
+            if (events[i].type == EV_SYN &&
+                events[i].code == SYN_DROPPED) {
+                if (!member->syncing) {
+                    log_warn("controller %d: input event queue overrun on "
+                             "%s (%s; %s); discarding events through the "
+                             "next report",
+                             c->index + 1, member->path,
+                             member->name,
+                             controller_member_role(member));
+                }
+                member->syncing = true;
+                member->dirty = false;
+                if (member->primary)
+                    c->outcount = 0;
+                continue;
+            }
+
+            if (member->syncing) {
+                if (events[i].type == EV_SYN &&
+                    events[i].code == SYN_REPORT) {
+                    member->syncing = false;
+                    controller_resync_member_state(c, member);
+                }
+                continue;
+            }
+
             if (member->primary)
                 controller_handle_primary_event(c, &events[i]);
             else
@@ -1722,12 +2090,18 @@ static int scan_devices(struct daemon *d)
     bool grouped[DS4_MAX_DEVICES];
     static char failed_group[DS4_GROUP_MAX];
     static uint64_t failed_at;
+    uint64_t scan_start_ms = monotonic_ms();
     int n;
     int i;
 
     n = enumerate_devices(infos, DS4_MAX_DEVICES, false);
-    if (n < 0)
-        return count_active_controllers(d);
+    if (n < 0) {
+        int active = count_active_controllers(d);
+
+        log_debug("device scan failed after %llums",
+                  (unsigned long long)(monotonic_ms() - scan_start_ms));
+        return active;
+    }
 
     memset(grouped, 0, sizeof(grouped));
 
@@ -1819,6 +2193,13 @@ static int scan_devices(struct daemon *d)
                         continue;
                     }
 
+                    /* Do not attach motion sensors, audio jacks, etc. */
+                    if (!is_primary && !device_info_is_touchpad(di)) {
+                        close(di->fd);
+                        di->fd = -1;
+                        continue;
+                    }
+
                     /*
                      * Never install a second primary in an existing
                      * controller.  If the old primary is gone the
@@ -1856,7 +2237,15 @@ static int scan_devices(struct daemon *d)
         }
     }
 
-    return count_active_controllers(d);
+    {
+        int active = count_active_controllers(d);
+
+        log_debug("device scan: %d event nodes, %llums, %d controller(s)",
+                  n,
+                  (unsigned long long)(monotonic_ms() - scan_start_ms),
+                  active);
+        return active;
+    }
 }
 
 /* ------------------------------------------------------------------------- */
@@ -1926,6 +2315,34 @@ int daemon_run(struct daemon *d)
 
     if (daemon_acquire_lock(d) < 0)
         goto out;
+
+    if (d->trace_prefix[0] != '\0') {
+        char input_path[DS4_PATH_MAX];
+        char output_path[DS4_PATH_MAX];
+
+        d->trace_capacity = DS4_TRACE_RECORDS;
+        d->trace_records = calloc(d->trace_capacity,
+                                  sizeof(*d->trace_records));
+        if (d->trace_records == NULL) {
+            log_error("cannot allocate memory for timestamp trace: %s",
+                      strerror(errno));
+            goto out;
+        }
+
+        if (!trace_path(input_path, sizeof(input_path), d->trace_prefix,
+                        "-input.csv") ||
+            !trace_path(output_path, sizeof(output_path), d->trace_prefix,
+                        "-output.csv")) {
+            log_error("timestamp trace prefix is too long");
+            free(d->trace_records);
+            d->trace_records = NULL;
+            d->trace_capacity = 0;
+            goto out;
+        }
+        log_info("timestamp trace enabled (last %u records in memory); "
+                 "will write %s and %s on exit",
+                 DS4_TRACE_RECORDS, input_path, output_path);
+    }
 
     if (geteuid() != 0) {
         log_warn("running as uid %u; install the udev rules and run as "
@@ -2015,9 +2432,17 @@ int daemon_run(struct daemon *d)
                     ioctl(c->primary_fd, EVIOCRMFF, c->test_ff_id);
                 c->test_ff_id = -1;
             }
+            controller_log_diagnostics(c);
         }
 
-        if (g_rescan || monotonic_ms() - last_scan >= 1000) {
+        /*
+         * Enumerating every evdev node can block this single-threaded loop
+         * long enough to overrun a controller's kernel event queue.  inotify
+         * already reports event-node hotplug; only poll periodically when
+         * that watch could not be installed.
+         */
+        if (g_rescan || (d->inotify_fd < 0 &&
+                         monotonic_ms() - last_scan >= 1000)) {
             int active;
 
             g_rescan = 0;
@@ -2042,6 +2467,115 @@ out:
     return result;
 }
 
+static void daemon_trace_dump(struct daemon *d)
+{
+    char input_path[DS4_PATH_MAX];
+    char output_path[DS4_PATH_MAX];
+    FILE *input_file = NULL;
+    FILE *output_file = NULL;
+    bool input_opened = false;
+    bool output_opened = false;
+    uint64_t input_rows = 0;
+    uint64_t output_rows = 0;
+    size_t i;
+    bool input_error = false;
+    bool output_error = false;
+
+    if (d->trace_records == NULL)
+        return;
+
+    if (!trace_path(input_path, sizeof(input_path), d->trace_prefix,
+                    "-input.csv") ||
+        !trace_path(output_path, sizeof(output_path), d->trace_prefix,
+                    "-output.csv")) {
+        log_error("timestamp trace prefix is too long; cannot save traces");
+        free(d->trace_records);
+        d->trace_records = NULL;
+        d->trace_capacity = 0;
+        return;
+    }
+
+    input_file = fopen(input_path, "w");
+    if (input_file == NULL) {
+        log_error("cannot create %s: %s", input_path, strerror(errno));
+        input_error = true;
+    } else {
+        input_opened = true;
+        if (fprintf(input_file,
+                    "controller,generation,report,source_ns,read_ns,"
+                    "type,code,value\n") < 0)
+            input_error = true;
+    }
+
+    output_file = fopen(output_path, "w");
+    if (output_file == NULL) {
+        log_error("cannot create %s: %s", output_path, strerror(errno));
+        output_error = true;
+    } else {
+        output_opened = true;
+        if (fprintf(output_file,
+                    "controller,generation,report,write_ns,type,code,"
+                    "value\n") < 0)
+            output_error = true;
+    }
+
+    for (i = 0; i < d->trace_count; i++) {
+        size_t index = (d->trace_start + i) % d->trace_capacity;
+        const struct trace_record *record = &d->trace_records[index];
+
+        if (record->stream == TRACE_INPUT && input_file != NULL &&
+            !input_error) {
+            if (fprintf(input_file,
+                        "%u,%llu,%llu,%llu,%llu,%u,%u,%d\n",
+                        record->controller,
+                        (unsigned long long)record->generation,
+                        (unsigned long long)record->report_seq,
+                        (unsigned long long)record->timestamp_ns,
+                        (unsigned long long)record->observed_ns,
+                        record->type, record->code, record->value) < 0) {
+                input_error = true;
+            } else {
+                input_rows++;
+            }
+        } else if (record->stream == TRACE_OUTPUT && output_file != NULL &&
+                   !output_error) {
+            if (fprintf(output_file,
+                        "%u,%llu,%llu,%llu,%u,%u,%d\n",
+                        record->controller,
+                        (unsigned long long)record->generation,
+                        (unsigned long long)record->report_seq,
+                        (unsigned long long)record->timestamp_ns,
+                        record->type, record->code, record->value) < 0) {
+                output_error = true;
+            } else {
+                output_rows++;
+            }
+        }
+    }
+
+    if (input_file != NULL && fclose(input_file) < 0)
+        input_error = true;
+    if (output_file != NULL && fclose(output_file) < 0)
+        output_error = true;
+
+    if (input_error && input_opened)
+        log_error("error writing input trace %s", input_path);
+    if (output_error && output_opened)
+        log_error("error writing output trace %s", output_path);
+    log_info("timestamp trace processed: input=%llu rows, output=%llu rows",
+             (unsigned long long)input_rows,
+             (unsigned long long)output_rows);
+    if (d->trace_overwritten > 0)
+        log_warn("timestamp trace ring overwrote %llu old record(s)",
+                 (unsigned long long)d->trace_overwritten);
+
+    free(d->trace_records);
+    d->trace_records = NULL;
+    d->trace_capacity = 0;
+    d->trace_count = 0;
+    d->trace_start = 0;
+}
+
 void daemon_cleanup(struct daemon *d)
 {
     int i;
@@ -2050,6 +2584,8 @@ void daemon_cleanup(struct daemon *d)
         if (d->controllers[i].active)
             controller_destroy(d, &d->controllers[i]);
     }
+
+    daemon_trace_dump(d);
 
     if (d->active_flag)
         daemon_set_active(d, false);

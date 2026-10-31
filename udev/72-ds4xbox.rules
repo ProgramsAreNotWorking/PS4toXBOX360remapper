@@ -6,10 +6,10 @@
 # seat-late is what actually prevents the logged-in user from opening the
 # original controller nodes.
 #
-# The daemon runs as root, grabs the original evdev nodes with EVIOCGRAB
-# and creates a virtual Xbox 360/One pad with /dev/uinput.  The original
-# Sony nodes are left at 0600 root:root so that Steam, SDL, libinput and
-# other user programs cannot open them.
+# The daemon runs as root, grabs the gamepad and optional touchpad evdev nodes
+# with EVIOCGRAB, and creates a virtual Xbox 360/One pad with /dev/uinput.
+# The original Sony nodes (including unused sensors and audio nodes) are left
+# at 0600 root:root so user programs cannot open them.
 #
 # If your distribution numbers its rules differently, keep this file
 # between the uaccess rule and the seat-late rule.
