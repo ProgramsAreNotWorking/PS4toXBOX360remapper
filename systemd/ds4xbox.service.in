@@ -1,0 +1,52 @@
+[Unit]
+Description=ds4xbox - DualShock 4 / DualSense to Xbox 360/One remapper
+After=local-fs.target systemd-udevd.service
+Wants=systemd-udevd.service
+
+[Service]
+Type=simple
+Environment=PATH=/run/current-system/sw/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=@BINDIR@/ds4xbox --quiet
+Restart=on-failure
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=5
+
+# Safety net for SIGKILL or a crash: remove the "hide" flag and re-run udev
+# so the original PlayStation controller is usable again.
+ExecStopPost=-/bin/sh -c 'rm -f /run/ds4xbox/active; udevadm trigger --subsystem-match=input --action=change; udevadm trigger --subsystem-match=hidraw --action=change; udevadm trigger --subsystem-match=usb --action=change'
+
+# The daemon opens 0600 root-owned evdev nodes and /dev/uinput.
+User=root
+Group=root
+
+# Runtime directory for the single-instance lock file.
+RuntimeDirectory=ds4xbox
+RuntimeDirectoryMode=0755
+UMask=0077
+
+# Keep the device nodes available; the daemon needs /dev/input and /dev/uinput.
+PrivateDevices=no
+
+# Basic hardening.  The daemon does not need the network or a writable
+# system, but it does need to create uinput devices and open evdev nodes.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+ReadWritePaths=/run/ds4xbox
+# ProtectKernelTunables=yes would mount /sys read-only, and udevadm trigger
+# needs to write "change" to /sys/.../uevent.  Keep /sys writable for that.
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# AF_NETLINK is needed by the udevadm trigger child used to hide/restore
+# the original controller.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

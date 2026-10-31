@@ -1,3 +1,13 @@
+# ds4xbox build artifacts
+/ds4xbox
+/build/
+/tests/fake_ds4
+/tests/read_pad
+*.o
+/result
+/result-*
+.direnv/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
