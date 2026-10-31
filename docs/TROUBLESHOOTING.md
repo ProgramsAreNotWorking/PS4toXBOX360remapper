@@ -344,6 +344,12 @@ abre una incidencia con la salida de `evtest`.
 
   Debe vibrar una vez al detectar el mando y mostrar `rumble test playing`.
 
+- No uses un probador de mando del navegador como referencia fiable. Muchos
+  navegadores muestrean el mando a baja velocidad o con su propia capa de
+  compatibilidad, y pueden mostrar huecos o saltos que no existen en el
+  dispositivo. Para confirmar la entrada, usa `evtest` o `jstest` sobre el
+  mando virtual Xbox.
+
 - Comprueba que el mando real anuncia FF:
 
   ```bash
