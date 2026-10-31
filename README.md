@@ -490,6 +490,12 @@ Makefile        Compilación, instalación y pruebas
 
 ---
 
+## Uso de inteligencia artificial
+
+Este proyecto se desarrolló con apoyo de inteligencia artificial: DeepSeek
+V4.1 Flash se utilizó durante el desarrollo y GPT-6 Luna Max para los retoques
+finales.
+
 ## Licencia
 
 Este proyecto se publica en el dominio público bajo la
